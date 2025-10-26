@@ -11,18 +11,13 @@ from anthropic import Anthropic
 # =========================
 # CONFIG
 # =========================
-# Read secrets from Streamlit Cloud.
-# For local testing, you can temporarily replace with strings,
-# but DO NOT commit your real key.
 ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "MISSING_KEY")
 
-ICD_CSV_PATH = "icd_clean.csv"       # this CSV must be in the GitHub repo
-FAISS_LOCAL_PATH = "icd_index.faiss" # this file will be downloaded at runtime
+ICD_CSV_PATH = "icd_clean.csv"            # <-- keep this file in GitHub repo
+FAISS_LOCAL_PATH = "icd_index.faiss"      # <-- we will download this at runtime
 FAISS_REMOTE_URL = st.secrets.get(
     "FAISS_REMOTE_URL",
-    None
-    # Example of what you set in Streamlit secrets:
-    # "https://drive.google.com/uc?export=download&id=1RELqPQw6z-519NGHqcsiIifJWEGEY-0W"
+    None  # <-- set this in Streamlit secrets to your Drive direct download URL
 )
 
 EMBED_MODEL_NAME = "neuml/pubmedbert-base-embeddings"
@@ -30,51 +25,78 @@ TOP_K = 3
 
 
 # =========================
-# HELPERS: ensure FAISS index exists
+# HELPERS
 # =========================
 def ensure_faiss_local():
     """
-    Make sure icd_index.faiss is present on disk.
-    If not, download it from FAISS_REMOTE_URL (Google Drive direct link or similar).
+    Make sure icd_index.faiss exists locally and isn't empty.
+    If not, download it using FAISS_REMOTE_URL.
     """
-    if os.path.exists(FAISS_LOCAL_PATH):
-        return  # already have it in this container
+    if os.path.exists(FAISS_LOCAL_PATH) and os.path.getsize(FAISS_LOCAL_PATH) > 0:
+        return
 
     if not FAISS_REMOTE_URL:
         raise RuntimeError(
-            "FAISS index is not available locally and FAISS_REMOTE_URL is not set in secrets."
+            "FAISS index is not available locally and FAISS_REMOTE_URL "
+            "was not provided in Streamlit secrets."
         )
 
-    with st.spinner("Downloading ICD FAISS index..."):
+    with st.spinner("Downloading ICD FAISS index from remote..."):
         resp = requests.get(FAISS_REMOTE_URL)
         resp.raise_for_status()
         with open(FAISS_LOCAL_PATH, "wb") as f:
             f.write(resp.content)
 
+    # sanity check download
+    if os.path.getsize(FAISS_LOCAL_PATH) == 0:
+        raise RuntimeError("Downloaded FAISS index is 0 bytes. Download failed.")
 
-# =========================
-# CACHED LOADERS
-# =========================
+
 @st.cache_resource(show_spinner=True)
 def load_runtime_artifacts():
     """
-    Load everything heavy once per session:
+    Load heavy components once per session:
     - ICD dataframe (codes + descriptions)
     - FAISS index (for retrieval)
-    - Embedding model (to embed doctor's phrases)
-    - Anthropic client
+    - Embedding model (for encoding doctor phrases)
+    - Anthropic client (LLM)
+    Also surfaces debug info so we can see what's wrong on Streamlit Cloud.
     """
     # 1. Load ICD code table
+    if not os.path.exists(ICD_CSV_PATH):
+        raise RuntimeError(
+            f"Could not find {ICD_CSV_PATH}. "
+            "Make sure icd_clean.csv is committed in your GitHub repo."
+        )
     icd_df = pd.read_csv(ICD_CSV_PATH)
 
-    # 2. Make sure FAISS file exists locally; download it if missing
+    # 2. Ensure FAISS file exists locally, download if needed
     ensure_faiss_local()
-    index = faiss.read_index(FAISS_LOCAL_PATH)
 
-    # 3. Load embedding model
+    # 2a. Debug info: show size + first bytes so we know if Drive gave HTML
+    faiss_size = os.path.getsize(FAISS_LOCAL_PATH)
+    st.write(f"FAISS index file size: {faiss_size} bytes")
+
+    with open(FAISS_LOCAL_PATH, "rb") as f:
+        head = f.read(16)
+    st.write(f"First 16 bytes of FAISS file: {head}")
+
+    # 3. Try to load FAISS index
+    try:
+        index = faiss.read_index(FAISS_LOCAL_PATH)
+    except Exception as e:
+        raise RuntimeError(
+            "faiss.read_index() failed.\n"
+            "Possible causes:\n"
+            "- The downloaded file is actually HTML (Google Drive warning page), not a real .faiss file.\n"
+            "- The FAISS index was built on GPU and Streamlit is CPU-only.\n"
+            f"Original error: {e}"
+        )
+
+    # 4. Load embedding model
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 
-    # 4. Init Anthropic client
+    # 5. Init Anthropic client
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     return icd_df, index, embed_model, client
@@ -85,11 +107,11 @@ def load_runtime_artifacts():
 # =========================
 def extract_causes(client: Anthropic, text: str) -> dict:
     """
-    Ask Claude to parse the death certificate chain into:
+    Ask Claude to break the certificate text into:
     - immediate cause + interval
     - intermediate cause + interval
     - underlying cause + interval
-    Returns a dict with those keys.
+    Returns a dict.
     """
     prompt = f"""
 You are an expert mortality coder in a hospital.
@@ -118,7 +140,6 @@ Rules:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # If Claude doesn't give valid JSON, return fallback structure
         data = {
             "immediate_cause": "",
             "immediate_interval": "",
@@ -136,8 +157,7 @@ Rules:
 # =========================
 def build_search_phrases(cause_dict: dict):
     """
-    Build the list of phrases we will embed and search in FAISS.
-    We include immediate, intermediate, underlying causes (skip blanks).
+    Return phrases we want to embed & search in FAISS.
     """
     phrases = [
         cause_dict.get("immediate_cause", ""),
@@ -150,8 +170,7 @@ def build_search_phrases(cause_dict: dict):
 
 def search_icd_single(query: str, icd_df, embed_model, index, k=3):
     """
-    Embed one cause phrase and retrieve top-k ICD matches.
-    Returns a ranked list of {code, description, distance}.
+    Embed a single cause phrase, search FAISS, and return top-k matches.
     """
     qv = embed_model.encode(
         [query],
@@ -168,20 +187,19 @@ def search_icd_single(query: str, icd_df, embed_model, index, k=3):
             "distance": float(dist),
             "code": row.get("Full Code", None),
             "description": row.get("Full Description", None),
-            "interval": "",  # we'll attach interval separately for display
+            "interval": "",
         })
     return out
 
 
 def retrieve_icd_for_phrases(phrases, cause_info, icd_df, embed_model, index, k=3):
     """
-    Returns rows ready for display in the Streamlit table.
-    Each row has:
+    Build the table we show the user:
     - Section (Immediate / Intermediate / Underlying)
-    - cause_text
+    - cause_text (doctor wording)
     - interval
-    - icd_code
-    - icd_desc
+    - icd_code (top match)
+    - icd_desc (description of the ICD code)
     """
     table_rows = []
 
@@ -193,10 +211,9 @@ def retrieve_icd_for_phrases(phrases, cause_info, icd_df, embed_model, index, k=
 
     for label, cause_key, int_key in mapping:
         cause_txt = cause_info.get(cause_key, "").strip()
-        interval  = cause_info.get(int_key, "").strip()
+        interval = cause_info.get(int_key, "").strip()
 
         if cause_txt == "":
-            # Doctor/model left this level empty
             table_rows.append({
                 "row_label": label,
                 "cause_text": "",
@@ -208,7 +225,7 @@ def retrieve_icd_for_phrases(phrases, cause_info, icd_df, embed_model, index, k=
 
         hits = search_icd_single(cause_txt, icd_df, embed_model, index, k=k)
 
-        if len(hits) == 0:
+        if not hits:
             table_rows.append({
                 "row_label": label,
                 "cause_text": cause_txt,
@@ -230,13 +247,13 @@ def retrieve_icd_for_phrases(phrases, cause_info, icd_df, embed_model, index, k=
 
 
 # =========================
-# LLM STEP 2: validate chain
+# LLM STEP 2: validate causal chain
 # =========================
 def build_certificate_summary_for_validation(table_rows):
     """
-    Convert ICD mapping into a summary we can send to Claude for validation.
-    Example line:
-    - Immediate cause of death: J96.9 (respiratory failure -> Acute respiratory failure ...)
+    Build a summary for Claude so it can judge:
+    - Are these ICD codes reasonable?
+    - Is the sequence logical (underlying -> intermediate -> immediate)?
     """
     lines = []
     for row in table_rows:
@@ -251,14 +268,6 @@ def build_certificate_summary_for_validation(table_rows):
 
 
 def validate_chain_with_llm(client: Anthropic, certificate_summary: str) -> dict:
-    """
-    Ask Claude to:
-    - check ICD correctness vs phrase,
-    - flag ill-defined causes,
-    - check logical order underlying -> intermediate -> immediate,
-    - suggest fixes.
-    Returns a dict with validation status, issues, and suggested changes.
-    """
     validation_prompt = f"""
 You are a senior mortality coder with WHO ICD-10 experience.
 Validate the correctness of the coding and causal sequence below.
@@ -347,15 +356,15 @@ with right:
         if not cod_text.strip():
             st.error("Please enter the cause of death text first.")
         else:
-            # 1. Load heavy resources (FAISS, model, ICD table, client)
+            # 1. Load resources (will also print FAISS debug info to the app)
             icd_df, index, embed_model, client = load_runtime_artifacts()
 
-            # 2. Ask LLM to extract structured causes
+            # 2. Extract structured causes
             causes = extract_causes(client, cod_text)
             st.markdown("**Extracted structured causes:**")
             st.json(causes)
 
-            # 3. Map each cause level to ICD
+            # 3. ICD mapping
             table_rows = retrieve_icd_for_phrases(
                 build_search_phrases(causes),
                 causes,
@@ -378,7 +387,7 @@ with right:
                 use_container_width=True
             )
 
-            # 4. Ask LLM to validate coding + chain logic
+            # 4. Validation of sequence
             summary_for_validation = build_certificate_summary_for_validation(table_rows)
             validation = validate_chain_with_llm(client, summary_for_validation)
 
