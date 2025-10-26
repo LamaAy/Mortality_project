@@ -228,7 +228,7 @@ Return valid JSON with these keys exactly:
 
     # We'll try multiple model names so we don't hard-crash if one isn't allowed
     candidate_models = [
-        "claude-3-5-sonnet-latest",
+        "claude-sonnet-4-20250514",
         "claude-3-sonnet-20240229",
     ]
 
@@ -238,7 +238,7 @@ Return valid JSON with these keys exactly:
         try:
             response = client.messages.create(
                 model=m,
-                max_tokens=400,
+                max_tokens=150,
                 temperature=0,
                 messages=[
                     {
