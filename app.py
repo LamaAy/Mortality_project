@@ -1,571 +1,980 @@
-#############################################
-# app.py - Death Certificate Assistant
-# Retrieval → ICD → Validation → Certificate Preview
-#############################################
+"""
+Saudi Ministry of Health – Electronic Death Certificate System
+نظام شهادة الوفاة الإلكترونية – وزارة الصحة السعودية
+"""
 
-import os
-import json
-import requests
-import numpy as np
-import pandas as pd
-import faiss
 import streamlit as st
-from sentence_transformers import SentenceTransformer
-from anthropic import Anthropic
+import pandas as pd
+import numpy as np
+import json
+import re
+import datetime
+import io
+import os
+import pickle
 
+import anthropic
 
-#############################################
-# STREAMLIT PAGE CONFIG
-#############################################
-
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Death Certificate Assistant",
-    page_icon="💀",
-    layout="wide"
+    page_title="شهادة الوفاة | وزارة الصحة",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("Death Certificate Assistant 🏥")
-st.caption("Prototype for mortality coding support (ICD lookup + chain validation).")
+# ── CSS ──────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&family=Cairo:wght@400;600;700&display=swap');
 
+:root {
+  --green:       #006940;
+  --green-dark:  #004d2e;
+  --green-light: #e8f5ee;
+  --green-mid:   #00843D;
+  --gold:        #C8A951;
+  --gray-bg:     #f4f6f4;
+  --text:        #1a2e1a;
+  --border:      #c5d9c8;
+  --muted:       #5a7060;
+}
 
-#############################################
-# CONFIG / SECRETS
-#############################################
+html, body, [class*="css"] {
+  font-family: 'Tajawal', 'Cairo', sans-serif;
+  direction: rtl;
+  color: var(--text);
+}
 
-# Local filenames expected in the container / repo
-ICD_CSV_PATH     = "icd_clean.csv"
-FAISS_LOCAL_PATH = "icd_index.faiss"
+.main .block-container {
+  background: var(--gray-bg);
+  padding: 1.5rem 2rem;
+  max-width: 1200px;
+}
 
-# Embedding model used to encode phrases for FAISS retrieval
-EMBED_MODEL_NAME = "neuml/pubmedbert-base-embeddings"
+.moh-header {
+  background: linear-gradient(135deg, var(--green) 0%, var(--green-mid) 55%, var(--green-dark) 100%);
+  color: white;
+  padding: 1.4rem 2rem;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 4px 18px rgba(0,105,64,.3);
+  border-bottom: 3px solid var(--gold);
+}
+.moh-header h1 { font-size: 1.5rem; margin: 0; font-weight: 800; }
+.moh-header p  { font-size: .82rem; margin: .2rem 0 0; opacity: .8; }
+.moh-emblem {
+  width: 70px; height: 70px;
+  border: 2px solid rgba(200,169,81,.5);
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: .62rem; font-weight: 700;
+  color: var(--gold);
+  text-align: center;
+  line-height: 1.4;
+  padding: 6px;
+}
 
-# How many ICD hits to retrieve per cause
-TOP_K = 3
+section[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, var(--green) 0%, var(--green-dark) 100%);
+}
+section[data-testid="stSidebar"] * { color: #dceee2 !important; }
+section[data-testid="stSidebar"] h3 { color: white !important; font-weight: 700 !important; }
+section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.2) !important; }
+section[data-testid="stSidebar"] .stTextInput input {
+  background: rgba(255,255,255,.1) !important;
+  border-color: rgba(255,255,255,.3) !important;
+}
 
-# Anthropic key comes from Streamlit secrets in production
-ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", None)
+.section-card {
+  background: white;
+  border-radius: 8px;
+  padding: 1.4rem 1.6rem;
+  margin-bottom: 1.2rem;
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 6px rgba(0,0,0,.05);
+}
+.section-title {
+  color: var(--green);
+  font-size: .95rem;
+  font-weight: 700;
+  border-bottom: 2px solid var(--green-light);
+  padding-bottom: .45rem;
+  margin-bottom: 1rem;
+  letter-spacing: .03em;
+}
 
-# Optional: where to download FAISS from if not found locally.
-# IMPORTANT: must be a direct binary link using "resolve/main", NOT "blob/main".
-FAISS_REMOTE_URL = st.secrets.get("FAISS_REMOTE_URL", None)
+.stTextInput > div > div > input,
+.stTextArea > div > div > textarea,
+.stSelectbox > div > div > div {
+  border: 1.5px solid var(--border) !important;
+  border-radius: 6px !important;
+  font-family: 'Tajawal', sans-serif !important;
+  font-size: .93rem !important;
+  background: #fafcfa !important;
+}
+.stTextInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+  border-color: var(--green) !important;
+  box-shadow: 0 0 0 2px rgba(0,105,64,.1) !important;
+}
 
-if not ANTHROPIC_API_KEY:
-    st.error("Missing Anthropic API key in Streamlit secrets (ANTHROPIC_API_KEY). Please add it.")
+.stButton > button {
+  background: linear-gradient(135deg, var(--green), var(--green-mid));
+  color: white !important;
+  border: none;
+  border-radius: 6px;
+  font-family: 'Tajawal', sans-serif;
+  font-weight: 700;
+  font-size: .92rem;
+  padding: .52rem 1.6rem;
+  transition: box-shadow .2s, transform .15s;
+  box-shadow: 0 2px 8px rgba(0,105,64,.25);
+}
+.stButton > button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 5px 14px rgba(0,105,64,.35);
+}
+
+.step-bar {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 1.5rem;
+}
+.step { background:#d4ddd6; color:#5a7060; border-radius:20px; padding:5px 16px; font-size:.8rem; font-weight:600; }
+.step.active { background:var(--green); color:white; }
+.step.done   { background:var(--gold);  color:white; }
+
+.icd-card {
+  background: var(--green-light);
+  border: 1px solid #9ecaad;
+  border-radius: 6px;
+  padding: .85rem 1.1rem;
+  margin: .45rem 0;
+}
+.icd-code  { font-size:1.05rem; font-weight:800; color:var(--green); font-family:'Courier New',monospace; letter-spacing:.05em; }
+.icd-badge { display:inline-block; background:var(--green); color:white; border-radius:20px; padding:1px 10px; font-size:.7rem; margin:0 2px; font-weight:600; }
+.icd-desc  { color:#2a4a2e; font-size:.88rem; margin-top:.2rem; }
+
+.cert-preview {
+  background: white;
+  border: 2px solid var(--green);
+  border-radius: 8px;
+  padding: 2.2rem;
+  font-family: 'Tajawal', sans-serif;
+  box-shadow: 0 4px 20px rgba(0,105,64,.1);
+}
+.cert-title { font-size:1.6rem; font-weight:800; color:var(--green); }
+.cert-sub   { color:var(--muted); font-size:.88rem; }
+.cert-field { display:flex; justify-content:space-between; border-bottom:1px solid #e8ede9; padding:.36rem 0; font-size:.88rem; }
+.cert-label { font-weight:700; color:var(--green); min-width:155px; }
+.cert-stamp {
+  border:2px solid var(--green); border-radius:50%;
+  width:86px; height:86px;
+  display:flex; align-items:center; justify-content:center;
+  color:var(--green); font-weight:700; text-align:center; font-size:.65rem; line-height:1.5;
+}
+
+.stTabs [data-baseweb="tab"] { font-family:'Tajawal',sans-serif !important; font-weight:600; font-size:.88rem; }
+.stTabs [aria-selected="true"] { color:var(--green) !important; border-bottom-color:var(--green) !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Header ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="moh-header">
+  <div>
+    <h1>نظام شهادة الوفاة الإلكترونية</h1>
+    <p>وزارة الصحة &nbsp;|&nbsp; المملكة العربية السعودية</p>
+    <p style="font-size:.76rem;opacity:.65">Death Certificate Registration System &nbsp;|&nbsp; ICD-10 AI-Assisted Coding</p>
+  </div>
+  <div class="moh-emblem">وزارة<br>الصحة<br>MOH<br>KSA</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── API key from secrets ──────────────────────────────────────────────────────
+try:
+    API_KEY = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    st.error("مفتاح API غير موجود. يرجى إضافة ANTHROPIC_API_KEY في Streamlit Secrets.")
     st.stop()
 
+# ── Google Drive file IDs ─────────────────────────────────────────────────────
+# Set these two IDs once — the app downloads and caches the files automatically.
+# Find the ID in your Drive share link: drive.google.com/file/d/FILE_ID/view
+GDRIVE_EMBEDDINGS_ID = "1lSxHUBswhVtfTzDvbWHmsdmQIt0-Ne8J"   # embeddings.npy
+GDRIVE_METADATA_ID   = "1JM19CbSwtLgo7Uqeu_1MAnJuz-4m-hgJ"   # metadata.pkl
+CACHE_DIR            = os.path.join(os.path.expanduser("~"), ".icd10_cache")
 
-#############################################
-# FAISS INDEX HANDLING (download + validate)
-#############################################
-
-def assert_valid_faiss_file(path: str):
-    """
-    Check that the FAISS file:
-    - exists
-    - is non-empty
-    - does not look like an HTML page (which happens if you downloaded the Hugging Face 'blob/' URL instead of 'resolve/')
-    """
-    if (not os.path.exists(path)) or os.path.getsize(path) == 0:
-        raise RuntimeError("FAISS index is missing or empty after download.")
-
-    with open(path, "rb") as f:
-        header = f.read(32)
-
-    if header.startswith(b"<!DOCTYPE html") or header.startswith(b"<html"):
-        raise RuntimeError(
-            "Downloaded FAISS file looks like HTML, not a real FAISS index.\n"
-            "Double-check FAISS_REMOTE_URL. It must use '/resolve/main/...', NOT '/blob/main/...'."
-        )
-
-
-def ensure_faiss_local():
-    """
-    Make sure we have a valid local FAISS index at FAISS_LOCAL_PATH.
-    If it's invalid or missing, download from FAISS_REMOTE_URL (if provided).
-    """
-    # If we already have something, validate it
-    if os.path.exists(FAISS_LOCAL_PATH) and os.path.getsize(FAISS_LOCAL_PATH) > 0:
-        try:
-            assert_valid_faiss_file(FAISS_LOCAL_PATH)
-            return
-        except Exception as e:
-            st.warning(f"Local FAISS file failed validation, will re-download. Details: {e}")
-
-    # Otherwise we need to download
-    if not FAISS_REMOTE_URL:
-        raise RuntimeError(
-            "FAISS index not available locally and FAISS_REMOTE_URL "
-            "was not provided in Streamlit secrets."
-        )
-
-    with st.spinner("⬇️ Downloading FAISS index ..."):
-        resp = requests.get(FAISS_REMOTE_URL)
-        resp.raise_for_status()
-        with open(FAISS_LOCAL_PATH, "wb") as f:
-            f.write(resp.content)
-
-    # Validate the new download
-    assert_valid_faiss_file(FAISS_LOCAL_PATH)
-
-
-#############################################
-# RUNTIME ARTIFACTS (CACHED)
-#############################################
-
-@st.cache_resource(show_spinner=True)
-def load_runtime_artifacts():
-    """
-    Load heavy assets exactly once per session:
-      - ICD dataframe
-      - FAISS index
-      - Embedding model
-      - Anthropic client
-    """
-
-    # 1. ICD table
-    if not os.path.exists(ICD_CSV_PATH):
-        raise RuntimeError(
-            f"Could not find {ICD_CSV_PATH}. Make sure icd_clean.csv is available."
-        )
-    icd_df = pd.read_csv(ICD_CSV_PATH)
-
-    # 2. FAISS index (ensure it's here and valid, else download)
-    ensure_faiss_local()
-
-    # Optional debug info
-    faiss_size = os.path.getsize(FAISS_LOCAL_PATH)
-    st.write(f"📦 FAISS index size: {faiss_size} bytes")
-    with open(FAISS_LOCAL_PATH, "rb") as f:
-        first16 = f.read(16)
-    st.write(f"🔎 First 16 bytes of FAISS file: {first16}")
-
-    # Load FAISS into memory
-    try:
-        index = faiss.read_index(FAISS_LOCAL_PATH)
-    except Exception as e:
-        raise RuntimeError(
-            "faiss.read_index() failed.\n"
-            "Possible causes:\n"
-            "- The downloaded file is not a valid FAISS index (HTML instead of binary).\n"
-            "- The FAISS index was built on GPU but this runtime only has CPU FAISS.\n"
-            f"Original error: {e}"
-        )
-
-    # 3. Embedding model
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-
-    # 4. Anthropic client
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    return icd_df, index, embed_model, client
-
-
-#############################################
-# STEP 1: LLM extraction of causes + intervals
-#############################################
-
-def extract_causes(client: Anthropic, text: str) -> dict:
-    """
-    Use Anthropic to split the doctor's narrative into:
-      - immediate cause + interval
-      - intermediate cause + interval
-      - underlying cause + interval
-    Returns a dict with those exact keys.
-    """
-    prompt = f"""
-You are an expert mortality coder in a hospital.
-Extract the following information from this text and return ONLY valid JSON with these exact keys:
-{{
-  "immediate_cause": "",
-  "immediate_interval": "",
-  "intermediate_cause": "",
-  "intermediate_interval": "",
-  "underlying_cause": "",
-  "underlying_interval": ""
-}}
-Text: {text}
-Rules:
-- If something is missing, leave it as an empty string "".
-- Do not include any markdown or explanation, only JSON.
-"""
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=250,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = response.content[0].text
-    except Exception as e:
-        return {
-            "immediate_cause": "",
-            "immediate_interval": "",
-            "intermediate_cause": "",
-            "intermediate_interval": "",
-            "underlying_cause": "",
-            "underlying_interval": "",
-            "_error": f"Anthropic call failed: {e}"
-        }
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {
-            "immediate_cause": "",
-            "immediate_interval": "",
-            "intermediate_cause": "",
-            "intermediate_interval": "",
-            "underlying_cause": "",
-            "underlying_interval": "",
-            "_raw": raw
-        }
-
-    return data
-
-
-#############################################
-# STEP 2: FAISS ICD retrieval
-#############################################
-
-def search_icd_single(query: str, icd_df, embed_model, index, k=3):
-    """
-    Embed a single cause phrase and retrieve k nearest ICD codes.
-    """
-    if not query.strip():
-        return []
-
-    qv = embed_model.encode(
-        [query],
-        convert_to_numpy=True,
-        normalize_embeddings=True
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### اعدادات النظام")
+    st.markdown("---")
+    st.markdown("### بيانات ICD-10")
+    st.markdown(
+        '<div style="font-size:.78rem;opacity:.8;padding:.3rem 0;line-height:1.7">'        'البيانات تُحمَّل تلقائياً من Google Drive'        '<br>ولا تحتاج إلى رفع أي ملف.</div>',
+        unsafe_allow_html=True,
     )
-    # make sure it's float32 for faiss
-    qv = np.asarray(qv, dtype="float32")
+    if st.button("إعادة تحميل البيانات", use_container_width=True):
+        import shutil
+        if os.path.exists(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+        st.session_state.df_icd      = None
+        st.session_state.faiss_index = None
+        st.cache_resource.clear()
+        st.rerun()
 
-    scores, idxs = index.search(qv, k)
+    st.markdown("---")
+    st.markdown("### بيانات المستشفى")
+    hospital_name = st.text_input("اسم المستشفى", value="مستشفى الملك فهد التخصصي")
+    hospital_city = st.text_input("المدينة", value="الرياض")
+    doctor_name   = st.text_input("اسم الطبيب المُصدر", value="")
 
-    out = []
-    for rank, (row_i, dist) in enumerate(zip(idxs[0], scores[0]), start=1):
-        row = icd_df.iloc[row_i]
-        out.append({
-            "rank": rank,
-            "distance": float(dist),
-            "code": row.get("Full Code", None),
-            "description": row.get("Full Description", None),
-        })
-    return out
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:.7rem;opacity:.55;text-align:center;line-height:2">'        'وزارة الصحة – 1446هـ<br>الإصدار 2.3</div>',
+        unsafe_allow_html=True,
+    )
 
+# ── Session state ──────────────────────────────────────────────────────────────
+for k, v in [("page", 1), ("form_data", {}), ("icd_results", None),
+             ("df_icd", None), ("faiss_index", None)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-def retrieve_icd_for_certificate_rows(cause_info, icd_df, embed_model, index, k=3):
-    """
-    Build table rows representing the death certificate rows:
-      1. Immediate cause of death
-      2. Intermediate cause of death I
-      3. Underlying cause of death II
+# ── Google Drive downloader ───────────────────────────────────────────────────
+def _gdrive_download(file_id: str, dest_path: str) -> None:
+    """Download a public Google Drive file, handling the virus-scan redirect."""
+    import requests
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    session  = requests.Session()
+    URL      = "https://drive.google.com/uc"
+    response = session.get(URL, params={"export": "download", "id": file_id}, stream=True)
+    # Handle large-file confirmation
+    token = next((v for k, v in response.cookies.items() if k.startswith("download_warning")), None)
+    if token:
+        response = session.get(URL, params={"export": "download", "id": file_id, "confirm": token}, stream=True)
+    if b"confirm=" in response.content[:3000]:
+        import re as _re
+        m = _re.search(rb'confirm=([0-9A-Za-z_\-]+)', response.content[:3000])
+        if m:
+            response = session.get(URL, params={"export": "download", "id": file_id,
+                                                "confirm": m.group(1).decode()}, stream=True)
+    with open(dest_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
 
-    Each row has:
-      - label
-      - cause text
-      - interval
-      - icd_code
-      - icd_desc
-    """
-    mapping = [
-        ("Immediate cause of death",      "immediate_cause",    "immediate_interval"),
-        ("Intermediate cause of death I", "intermediate_cause", "intermediate_interval"),
-        ("Underlying cause of death II",  "underlying_cause",   "underlying_interval"),
-    ]
+# ── ICD data helpers ──────────────────────────────────────────────────────────
+def _normalise_df(df: pd.DataFrame) -> pd.DataFrame:
+    if "CodeFormatted" not in df.columns:
+        try:
+            df.columns = ["Id","Code","CodeFormatted","ShortDesc","LongDesc",
+                          "HIPPA","Deleted","Classification","AcceptableMain",
+                          "GenderRestriction","MatchSource","MatchedFromCode","Note"]
+        except ValueError:
+            pass
+    if "Deleted" in df.columns:
+        df = df[df["Deleted"] != "Yes"].copy()
+    df = df.dropna(subset=["Code"]).reset_index(drop=True)
+    if "EmbedText" not in df.columns:
+        df["EmbedText"] = (df["CodeFormatted"].fillna("") + " | " +
+                           df["LongDesc"].fillna("") + " | " +
+                           df["ShortDesc"].fillna(""))
+    return df
 
-    table_rows = []
+@st.cache_resource(show_spinner="جارٍ تحميل بيانات ICD-10 من Google Drive...")
+def _load_icd_cached(embeddings_id: str, metadata_id: str, cache_dir: str):
+    """Download from Drive once, cache locally forever."""
+    os.makedirs(cache_dir, exist_ok=True)
+    emb_path  = os.path.join(cache_dir, "embeddings.npy")
+    meta_path = os.path.join(cache_dir, "metadata.pkl")
 
-    for row_label, cause_key, interval_key in mapping:
-        cause_txt = cause_info.get(cause_key, "").strip()
-        interval  = cause_info.get(interval_key, "").strip()
+    if embeddings_id and not os.path.exists(emb_path):
+        _gdrive_download(embeddings_id, emb_path)
 
-        if not cause_txt:
-            # nothing detected for this line
-            table_rows.append({
-                "row_label": row_label,
-                "cause_text": "",
-                "interval": "",
-                "icd_code": "",
-                "icd_desc": "",
-            })
-            continue
+    if metadata_id and not os.path.exists(meta_path):
+        _gdrive_download(metadata_id, meta_path)
 
-        hits = search_icd_single(cause_txt, icd_df, embed_model, index, k=k)
-        if len(hits) == 0:
-            table_rows.append({
-                "row_label": row_label,
-                "cause_text": cause_txt,
-                "interval": interval,
-                "icd_code": "N/A",
-                "icd_desc": "No match",
-            })
-        else:
-            best = hits[0]
-            table_rows.append({
-                "row_label": row_label,
-                "cause_text": cause_txt,
-                "interval": interval,
-                "icd_code": best["code"],
-                "icd_desc": best["description"],
-            })
+    # Load dataframe
+    df = None
+    if os.path.exists(meta_path):
+        with open(meta_path, "rb") as f:
+            df = pickle.load(f)
+        df = _normalise_df(df)
 
-    return table_rows
+    # Build FAISS index from embeddings
+    faiss_idx = None
+    if os.path.exists(emb_path) and df is not None:
+        try:
+            import faiss
+            emb       = np.load(emb_path).astype("float32")
+            faiss_idx = faiss.IndexFlatIP(emb.shape[1])
+            faiss_idx.add(emb)
+        except Exception:
+            pass
 
+    return df, faiss_idx
 
-#############################################
-# STEP 3: Validation / "is valid? why?"
-#############################################
-
-def build_certificate_summary_for_validation(table_rows):
-    """
-    Turn ICD assignment into bullet summary for validation.
-    Example:
-    - Immediate cause of death: J96.0 (Acute respiratory failure -> ...)
-    """
-    lines = []
-    for row in table_rows:
-        if not row["cause_text"]:
-            continue
-        lines.append(
-            f"- {row['row_label']}: {row['icd_code']} "
-            f"({row['cause_text']} -> {row['icd_desc']})"
-        )
-    return "\n".join(lines)
-
-
-def validate_chain_with_llm(client: Anthropic, certificate_summary: str) -> dict:
-    """
-    Ask Anthropic to check:
-      - Are these causes acceptable medically?
-      - Are any ill-defined / not true underlying causes of death?
-      - Is the causal chain logical?
-    """
-    validation_prompt = f"""
-You are a senior mortality coder with WHO ICD-10 experience.
-Validate the correctness of the coding and causal sequence below.
-
-Certificate summary:
-{certificate_summary}
-
-Tasks:
-1. Check if each ICD code correctly matches the cause phrase.
-2. Identify if any cause is *ill-defined* or *unlikely to cause death*.
-3. Evaluate if the causal order (underlying → intermediate → immediate) is logical.
-4. Suggest corrections if needed.
-5. Return your answer as structured JSON with this exact format:
-
-{{
-  "validation_status": "Valid" or "Needs review",
-  "issues": [list of problems or empty if none],
-  "suggested_changes": {{
-     "immediate_cause": "",
-     "intermediate_cause": "",
-     "underlying_cause": ""
-  }}
-}}
-"""
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=200,
-            temperature=0,
-            messages=[{"role": "user", "content": validation_prompt}]
-        )
-        raw = response.content[0].text
-    except Exception as e:
-        return {
-            "validation_status": "Needs review",
-            "issues": [f"Anthropic call failed: {e}"],
-            "suggested_changes": {
-                "immediate_cause": "",
-                "intermediate_cause": "",
-                "underlying_cause": ""
-            }
-        }
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = {
-            "validation_status": "Needs review",
-            "issues": ["LLM returned non-JSON", raw],
-            "suggested_changes": {
-                "immediate_cause": "",
-                "intermediate_cause": "",
-                "underlying_cause": ""
-            }
-        }
-
-    return data
-
-
-#############################################
-# SMALL UTILS FOR CERTIFICATE PREVIEW
-#############################################
-
-def pick_row(table_rows, label):
-    """
-    Find "Immediate cause of death", etc. in table_rows.
-    Returns a dict with cause_text, interval, icd_code, icd_desc (or blanks).
-    """
-    for r in table_rows:
-        if r["row_label"] == label:
-            return r
+def _row_to_dict(row, score: float) -> dict:
     return {
-        "cause_text": "",
-        "interval": "",
-        "icd_code": "",
-        "icd_desc": ""
+        "code":               str(row.get("Code", "")),
+        "code_formatted":     str(row.get("CodeFormatted", "")),
+        "short_desc":         str(row.get("ShortDesc", "")),
+        "long_desc":          str(row.get("LongDesc", "")),
+        "acceptable_main":    str(row.get("AcceptableMain", "")),
+        "gender_restriction": str(row.get("GenderRestriction", "")),
+        "classification":     str(row.get("Classification", "")),
+        "similarity":         score,
     }
 
+@st.cache_resource(show_spinner="تحميل نموذج التضمين...")
+def _embed_model():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-#############################################
-# STREAMLIT UI LAYOUT
-#############################################
+def search_icd(df, fidx, query: str, top_k: int = 6) -> list:
+    if fidx is not None:
+        try:
+            model = _embed_model()
+            q_vec = model.encode([query], normalize_embeddings=True,
+                                 convert_to_numpy=True).astype("float32")
+            scores, indices = fidx.search(q_vec, top_k)
+            return [_row_to_dict(df.iloc[idx], float(s))
+                    for s, idx in zip(scores[0], indices[0]) if idx != -1]
+        except Exception:
+            pass
+    terms = query.lower().split()
+    sc    = df["EmbedText"].str.lower().apply(lambda x: sum(t in x for t in terms))
+    top   = sc.nlargest(top_k).index
+    return [_row_to_dict(df.iloc[i], float(sc[i])) for i in top if sc[i] > 0]
 
-left, right = st.columns([1, 1])
+# ── Auto-load on startup ───────────────────────────────────────────────────────
+if st.session_state.df_icd is None:
+    if not GDRIVE_EMBEDDINGS_ID and not GDRIVE_METADATA_ID:
+        st.sidebar.warning("يرجى إضافة GDRIVE_EMBEDDINGS_ID أو GDRIVE_METADATA_ID في الكود.")
+    else:
+        try:
+            df, fidx = _load_icd_cached(GDRIVE_EMBEDDINGS_ID, GDRIVE_METADATA_ID, CACHE_DIR)
+            if df is not None:
+                st.session_state.df_icd      = df
+                st.session_state.faiss_index = fidx
+                mode = "FAISS + embeddings" if fidx is not None else "keyword"
+                st.sidebar.success(f"تم تحميل {len(df):,} رمز  ({mode})")
+            else:
+                st.sidebar.warning(
+                    "تم تحميل embeddings.npy.\n\n"
+                    "أضف GDRIVE_METADATA_ID (file ID لملف metadata.pkl) في السطر 8 من الكود."
+                )
+        except Exception as e:
+            st.sidebar.error(f"خطأ في التحميل: {e}")
 
-with left:
-    st.subheader("Patient info")
-    patient_name = st.text_input("Name")
-    patient_id = st.text_input("ID / MRN")
-    gender = st.selectbox("Gender", ["", "Male", "Female", "Other"])
+# ── Claude helpers ─────────────────────────────────────────────────────────────
+def call_claude(system_prompt: str, user_content: str, max_tokens: int = 1500) -> str:
+    client = anthropic.Anthropic(api_key=API_KEY)
+    resp   = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    return resp.content[0].text.strip()
 
-    st.subheader("Cause of death (doctor free text)")
-    st.write("Write the chain exactly how you'd put it on the certificate.")
-    default_note = "Respiratory failure (3 days) due to severe bacterial pneumonia (5 days) due to COPD (10 years)"
-    cod_text = st.text_area(
-        "Cause of death narrative:",
-        value=default_note,
-        height=160
+def extract_concepts(free_text: str, gender: str, age: str) -> dict:
+    sys_p = (
+        "You are a clinical coding assistant for Saudi MOH death certificates. "
+        "Extract structured medical information. "
+        'Return ONLY valid JSON: {"immediate_cause":"string","contributing_causes":["list"],'
+        '"other_conditions":["list"],"intervals":{"immediate_cause":"hours/days",'
+        '"contributing_causes":["years"]},"notes":"string"}. No markdown, no extra text.'
+    )
+    raw = call_claude(sys_p, f"Patient: {age}yo, {gender}.\n\n{free_text}", max_tokens=700)
+    raw = re.sub(r"^```json?\s*|\s*```$", "", raw).strip()
+    return json.loads(raw)
+
+def get_recommendation(concepts: dict, candidates: dict, gender: str, age: str, extra: str) -> str:
+    sys_p = (
+        "You are a senior clinical coding specialist at Saudi MOH. "
+        "Structure your Arabic response with exactly these six numbered sections:\n\n"
+        "(1) السبب المباشر للوفاة\n"
+        "Write one ICD code per line in this exact format: CODE - description\n"
+        "Then one short justification line starting with *\n\n"
+        "(2) الأسباب المساهمة\n"
+        "Each cause: CODE - description, then one bullet *\n\n"
+        "(3) حالات أخرى مساهمة\n"
+        "Each: CODE - description\n\n"
+        "(4) التحقق من صحة العمر والجنس\n"
+        "One short sentence.\n\n"
+        "(5) قواعد التشفير WHO/MOH\n"
+        "Two or three bullets starting with *\n\n"
+        "(6) الترميز النهائي للإحصائيات\n"
+        "One line: السبب الأساسي: CODE\n\n"
+        "STRICT RULES: No markdown bold (**), no emoji, no headers with #. "
+        "ICD codes always in format LETTER+DIGITS+DOT+DIGITS (e.g. I21.0, E11.9). "
+        "Keep each section brief."
+    )
+    user = (
+        f"Patient: {age}yo, {gender}\n{extra}\n\n"
+        f"Concepts:\n{json.dumps(concepts, ensure_ascii=False, indent=2)}\n\n"
+        f"Candidates:\n{json.dumps(candidates, ensure_ascii=False, indent=2)}"
+    )
+    return call_claude(sys_p, user, max_tokens=1200)
+
+# ── Step bar ──────────────────────────────────────────────────────────────────
+def render_steps(current: int):
+    labels = ["البيانات الأساسية", "السيرة المرضية", "أسباب الوفاة", "المراجعة والتوصيات"]
+    html   = '<div class="step-bar">'
+    for i, lbl in enumerate(labels, 1):
+        cls = "step active" if i == current else ("step done" if i < current else "step")
+        html += f'<div class="{cls}">{i}. {lbl}</div>'
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+# =============================================================================
+#  PAGE 1 — Patient Basic Information
+# =============================================================================
+if st.session_state.page == 1:
+    render_steps(1)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">البيانات الأساسية للمتوفى / Patient Basic Information</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        full_name_ar = st.text_input("الاسم الكامل (عربي)*", placeholder="محمد بن عبدالله العتيبي")
+        full_name_en = st.text_input("Full Name (English)",   placeholder="Mohammed Abdullah Al-Otaibi")
+        national_id  = st.text_input("رقم الهوية / الإقامة*", placeholder="1XXXXXXXXX")
+        nationality  = st.text_input("الجنسية / Nationality", placeholder="سعودي")
+        dob = st.date_input("تاريخ الميلاد / Date of Birth",
+                            value=datetime.date(1960, 1, 1),
+                            min_value=datetime.date(1900, 1, 1),
+                            max_value=datetime.date.today())
+    with c2:
+        sex            = st.selectbox("الجنس / Sex*", ["ذكر / Male", "أنثى / Female"])
+        marital_status = st.selectbox("الحالة الاجتماعية",
+                                      ["أعزب / Single","متزوج / Married","مطلق / Divorced","أرمل / Widowed"])
+        education      = st.selectbox("المستوى التعليمي / Education",
+                                      ["أمي / Illiterate","ابتدائي / Primary","متوسط / Intermediate",
+                                       "ثانوي / Secondary","دبلوم / Diploma","بكالوريوس / Bachelor",
+                                       "دراسات عليا / Postgraduate","غير معلوم / Unknown"])
+        occupation     = st.text_input("المهنة / Occupation", placeholder="مهندس")
+        address        = st.text_input("العنوان / Address",   placeholder="الرياض – حي العليا")
+
+    st.markdown("---")
+    c3, c4 = st.columns(2)
+    with c3:
+        dod           = st.date_input("تاريخ الوفاة / Date of Death*", value=datetime.date.today())
+        time_of_death = st.time_input("وقت الوفاة / Time of Death")
+        place_of_death = st.selectbox("مكان الوفاة / Place of Death",
+                                      ["المستشفى / Hospital","الطوارئ / Emergency",
+                                       "المنزل / Home","الطريق / Road","غير معلوم / Unknown"])
+    with c4:
+        cert_number = st.text_input("رقم الشهادة / Certificate No.", placeholder="DC-2025-XXXXX")
+        date_issued = st.date_input("تاريخ الإصدار / Issue Date", value=datetime.date.today())
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    age_years = max(0, (dod - dob).days // 365) if dob and dod else 0
+    st.info(f"العمر عند الوفاة: {age_years} سنة  /  Age at Death: {age_years} years")
+
+    if st.button("التالي"):
+        if not full_name_ar or not national_id:
+            st.error("يرجى إدخال الاسم الكامل ورقم الهوية.")
+        else:
+            st.session_state.form_data.update({
+                "full_name_ar": full_name_ar, "full_name_en": full_name_en,
+                "national_id":  national_id,  "nationality":  nationality,
+                "dob": str(dob), "dod": str(dod),
+                "time_of_death": str(time_of_death), "place_of_death": place_of_death,
+                "sex": sex, "marital_status": marital_status,
+                "education": education, "occupation": occupation, "address": address,
+                "age_years": age_years, "cert_number": cert_number, "date_issued": str(date_issued),
+            })
+            st.session_state.page = 2
+            st.rerun()
+
+# =============================================================================
+#  PAGE 2 — Medical History
+# =============================================================================
+elif st.session_state.page == 2:
+    render_steps(2)
+    fd = st.session_state.form_data
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">السيرة المرضية / Medical History</div>', unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        had_surgery = st.radio(
+            "هل أجرى المريض عملية جراحية خلال آخر شهر؟ / Surgery within last month?",
+            ["لا / No", "نعم / Yes", "غير معلوم / Unknown"],
+        )
+        surgery_details = ""
+        if had_surgery == "نعم / Yes":
+            surgery_details = st.text_area("تفاصيل العملية / Surgery Details",
+                                           placeholder="نوع العملية، التاريخ، المستشفى")
+        autopsy_required = st.radio(
+            "هل التشريح مطلوب من وجهة نظر الطبيب؟ / Autopsy required (doctor)?",
+            ["لا / No", "نعم / Yes", "غير محدد / Undetermined"],
+        )
+        autopsy_reason = ""
+        if autopsy_required == "نعم / Yes":
+            autopsy_reason = st.text_input("سبب طلب التشريح / Reason for autopsy")
+
+    with c2:
+        death_type     = st.selectbox("نوع الوفاة / Type of Death",
+                                      ["طبيعية / Natural","حادث / Accident",
+                                       "انتحار / Suicide","قتل / Homicide","غير محدد / Undetermined"])
+        inpatient_days = st.number_input("مدة الإقامة بالمستشفى (أيام) / Hospital Stay (days)",
+                                         min_value=0, value=0)
+        was_pregnant = "لا ينطبق / N/A"
+        if "أنثى" in fd.get("sex", ""):
+            was_pregnant = st.selectbox("الحالة أثناء الوفاة / Pregnancy Status",
+                                        ["لا / No","حامل / Pregnant",
+                                         "أثناء الولادة / During delivery",
+                                         "بعد الولادة 42 يوم / Within 42 days postpartum","لا ينطبق / N/A"])
+        chronic_conditions = st.multiselect(
+            "الأمراض المزمنة المعروفة / Known Chronic Conditions",
+            ["داء السكري / Diabetes","ارتفاع ضغط الدم / Hypertension",
+             "أمراض القلب / Heart Disease","أمراض الكلى / Renal Disease",
+             "أمراض الكبد / Liver Disease","السرطان / Cancer",
+             "أمراض الرئة / Pulmonary Disease","السمنة / Obesity",
+             "أمراض عصبية / Neurological","أخرى / Other"],
+        )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    b1, b2, _ = st.columns([1, 1, 6])
+    with b1:
+        if st.button("السابق", use_container_width=True):
+            st.session_state.page = 1; st.rerun()
+    with b2:
+        if st.button("التالي", use_container_width=True):
+            st.session_state.form_data.update({
+                "had_surgery": had_surgery, "surgery_details": surgery_details,
+                "autopsy_required": autopsy_required, "autopsy_reason": autopsy_reason,
+                "death_type": death_type, "inpatient_days": inpatient_days,
+                "was_pregnant": was_pregnant, "chronic_conditions": chronic_conditions,
+            })
+            st.session_state.page = 3; st.rerun()
+
+# =============================================================================
+#  PAGE 3 — Free-text causes of death
+# =============================================================================
+elif st.session_state.page == 3:
+    render_steps(3)
+    fd = st.session_state.form_data
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">أسباب الوفاة / Causes of Death</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        '<div style="background:#fffbe6;border-right:3px solid #C8A951;padding:9px 14px;'
+        'border-radius:5px;margin-bottom:1.1rem;font-size:.87rem;color:#5a4a00">'
+        'اكتب وصفاً سردياً لأسباب الوفاة — السبب الفوري أولاً ثم الأسباب الكامنة والمدد الزمنية. '
+        'النظام سيستخرج الأسباب والفترات تلقائياً.</div>',
+        unsafe_allow_html=True)
+
+    free_text = st.text_area(
+        "وصف أسباب الوفاة / Narrative description",
+        value=fd.get("free_text", ""),
+        height=200,
+        placeholder=(
+            "مثال: توفي المريض إثر فشل قلبي حاد (27 يوماً) ناتج عن احتشاء عضلة القلب الحاد "
+            "في الجدار الأمامي (15 سنة) بسبب تصلب الشرايين التاجية. "
+            "كان يعاني من داء السكري من النوع الثاني وارتفاع ضغط الدم المزمن."
+        ),
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    b1, b2, _ = st.columns([1, 1.4, 6])
+    with b1:
+        if st.button("السابق", use_container_width=True):
+            st.session_state.page = 2
+            st.rerun()
+    with b2:
+        if st.button("تحليل وترميز", use_container_width=True, type="primary"):
+            if not free_text.strip():
+                st.error("يرجى كتابة وصف أسباب الوفاة.")
+            elif st.session_state.df_icd is None:
+                st.error("بيانات ICD-10 لم تُحمَّل بعد.")
+            else:
+                st.session_state.form_data["free_text"] = free_text
+                st.session_state.icd_results = None
+                st.session_state.page = 4
+                st.rerun()
+
+# =============================================================================
+#  PAGE 4 — AI Analysis: 2-step pipeline then results
+# =============================================================================
+elif st.session_state.page == 4:
+    render_steps(4)
+    fd     = st.session_state.form_data
+    df_icd = st.session_state.df_icd
+    fidx   = st.session_state.faiss_index
+
+    gender_str = "Male" if "ذكر" in fd.get("sex", "") else "Female"
+    age_str    = str(fd.get("age_years", "Unknown"))
+    extra_ctx  = (
+        "Surgery last month: " + fd.get("had_surgery", "No") + "\n"
+        "Autopsy required: " + fd.get("autopsy_required", "No") + "\n"
+        "Chronic conditions: " + ", ".join(fd.get("chronic_conditions", [])) + "\n"
+        "Death type: " + fd.get("death_type", "Natural")
     )
 
-    run_button = st.button("Analyze 🔍")
+    # ── Load full Excel from Google Sheets (cached after first run) ───────────
+    SHEETS_ID   = "179CylYJwn2O6AdToCY4EcbeHp-kW_wGu"
+    EXCEL_CACHE = os.path.join(CACHE_DIR, "icd10_excel.pkl")
 
+    @st.cache_resource(show_spinner="تحميل ملف Excel من Google Drive...")
+    def _load_excel_sheets(sheet_id):
+        import requests
+        url = ("https://docs.google.com/spreadsheets/d/"
+               + sheet_id + "/export?format=xlsx")
+        r = requests.get(url, timeout=90)
+        r.raise_for_status()
+        df = pd.read_excel(io.BytesIO(r.content))
+        expected = ["Id", "Code", "CodeFormatted", "ShortDesc", "LongDesc",
+                    "HIPPA", "Deleted", "Classification", "AcceptableMain",
+                    "GenderRestriction", "MatchSource", "MatchedFromCode", "Note"]
+        if len(df.columns) == len(expected):
+            df.columns = expected
+        if "Deleted" in df.columns:
+            df = df[df["Deleted"] != "Yes"].copy()
+        df = df.dropna(subset=["Code"]).reset_index(drop=True)
+        return df
 
-with right:
-    st.subheader("Results")
+    try:
+        df_excel = _load_excel_sheets(SHEETS_ID)
+    except Exception as ex_err:
+        st.warning("تعذّر تحميل Excel من Drive، سيُستخدم metadata كبديل. " + str(ex_err))
+        df_excel = df_icd
 
-    if run_button:
-        if not cod_text.strip():
-            st.error("Please enter the cause of death text first.")
-        else:
-            # 1. Load heavy stuff (cached)
-            icd_df, index, embed_model, client = load_runtime_artifacts()
+    def get_excel_row(df, code_str):
+        if df is None or not code_str:
+            return {}
+        c = code_str.strip().upper().replace(" ", "")
+        row = df[df["CodeFormatted"].str.upper().str.replace(" ", "", regex=False) == c]
+        if row.empty:
+            row = df[df["Code"].str.upper().str.replace(" ", "", regex=False) == c]
+        if row.empty:
+            return {}
+        return row.iloc[0].to_dict()
 
-            # 2. Extract structured causes from doctor's narrative
-            causes = extract_causes(client, cod_text)
-            st.markdown("**Step 1. Extracted structured causes (LLM):**")
-            st.json(causes)
-
-            # 3. Map each cause to ICD via FAISS
-            table_rows = retrieve_icd_for_certificate_rows(
-                causes, icd_df, embed_model, index, k=TOP_K
+    # ── 2-step pipeline ───────────────────────────────────────────────────────
+    if st.session_state.icd_results is None:
+        progress = st.empty()
+        try:
+            # STEP 1 ─ extract causes & intervals
+            progress.info("الخطوة 1 من 2: استخراج الأسباب والفترات الزمنية...")
+            step1_sys = (
+                "You are a clinical coding assistant for Saudi MOH death certificates. "
+                "From the doctor's free-text narrative, extract ALL causes of death with time intervals. "
+                "Return ONLY valid JSON, no markdown:\n"
+                '{"immediate_cause":"string",'
+                '"contributing_causes":["string",...],'
+                '"other_conditions":["string",...],'
+                '"intervals":{"immediate_cause":"e.g. 27 days",'
+                '"contributing_causes":["e.g. 15 years",...]}}'
             )
-            st.markdown("**Step 2. ICD suggestion table:**")
-            result_df = pd.DataFrame(table_rows)
-            st.dataframe(
-                result_df.rename(columns={
-                    "row_label": "Section",
-                    "cause_text": "Cause of death text",
-                    "interval": "Interval",
-                    "icd_code": "ICD Code",
-                    "icd_desc": "ICD Description"
-                }),
-                use_container_width=True
+            step1_user = (
+                "Patient: " + age_str + "yo, " + gender_str + ".\n"
+                + "Extra: " + extra_ctx + "\n\n"
+                + "Doctor narrative:\n" + fd["free_text"]
+            )
+            raw1 = call_claude(step1_sys, step1_user, max_tokens=600)
+            raw1 = re.sub(r"^```json?\s*|\s*```$", "", raw1).strip()
+            concepts = json.loads(raw1)
+
+            # Build cause list
+            ivs         = concepts.get("intervals", {}) or {}
+            contrib_ivs = ivs.get("contributing_causes", [])
+            all_causes  = []
+            if concepts.get("immediate_cause"):
+                all_causes.append({
+                    "role": "immediate", "label": "السبب الفوري",
+                    "cause": concepts["immediate_cause"],
+                    "interval": ivs.get("immediate_cause", "—"),
+                })
+            for ci, c in enumerate(concepts.get("contributing_causes") or []):
+                all_causes.append({
+                    "role": "contributing",
+                    "label": "سبب مساهم " + str(ci + 1),
+                    "cause": c,
+                    "interval": contrib_ivs[ci] if ci < len(contrib_ivs) else "—",
+                })
+            for c in (concepts.get("other_conditions") or []):
+                all_causes.append({
+                    "role": "other", "label": "حالة أخرى",
+                    "cause": c, "interval": "—",
+                })
+
+            # STEP 2 ─ per-cause: embedding search → fetch Excel rows → Claude
+            progress.info("الخطوة 2 من 2: البحث في قاعدة ICD-10 وتقييم كل سبب...")
+            step2_sys = (
+                "You are a senior clinical coding specialist at Saudi MOH. "
+                "Given the patient info, the cause of death, and the top-5 ICD-10 candidate rows "
+                "(with AcceptableMain, GenderRestriction, Classification, LongDesc), "
+                "select the BEST ICD-10 code. "
+                "Return ONLY valid JSON, no markdown:\n"
+                '{"selected_code":"e.g. I21.0",'
+                '"code_formatted":"e.g. I21.0",'
+                '"short_desc":"from selected row",'
+                '"long_desc":"from selected row",'
+                '"acceptable_main":"Acceptable or Not Acceptable",'
+                '"notes":"Arabic: clinical justification + warnings if unacceptable or gender mismatch"}'
             )
 
-            # 4. Ask LLM to validate medical logic and chain
-            certificate_summary = build_certificate_summary_for_validation(table_rows)
-            validation = validate_chain_with_llm(client, certificate_summary)
-            st.markdown("**Step 3. Validation (LLM check):**")
-            st.json(validation)
+            coded_causes = []
+            for ci, cause_item in enumerate(all_causes):
+                progress.info(
+                    "الخطوة 2 من 2: تقييم السبب "
+                    + str(ci + 1) + " من " + str(len(all_causes))
+                    + " — " + cause_item["cause"][:40] + "...")
+                hits = search_icd(df_icd, fidx, cause_item["cause"], top_k=5)
+                full_rows = []
+                for h in hits:
+                    row_data = get_excel_row(df_excel, h.get("code_formatted", ""))
+                    full_rows.append(row_data if row_data else h)
 
-            # 5. Show a certificate-style preview (boxes)
-            st.markdown("### 📝 Death Certificate Preview (auto-filled)")
+                step2_user = (
+                    "Patient: " + age_str + "yo, " + gender_str + "\n"
+                    + "Role: " + cause_item["role"]
+                    + " | Interval: " + cause_item["interval"] + "\n"
+                    + "Cause: " + cause_item["cause"] + "\n\n"
+                    + "Top-5 ICD-10 candidates:\n"
+                    + json.dumps(full_rows, ensure_ascii=False, indent=2)
+                )
+                raw2 = call_claude(step2_sys, step2_user, max_tokens=500)
+                raw2 = re.sub(r"^```json?\s*|\s*```$", "", raw2).strip()
+                try:
+                    result = json.loads(raw2)
+                except Exception:
+                    result = {
+                        "selected_code": "", "code_formatted": "",
+                        "short_desc": cause_item["cause"], "long_desc": "",
+                        "acceptable_main": "Unknown", "notes": raw2,
+                    }
+                result["role"]     = cause_item["role"]
+                result["label"]    = cause_item["label"]
+                result["cause"]    = cause_item["cause"]
+                result["interval"] = cause_item["interval"]
+                coded_causes.append(result)
 
-            row_immediate    = pick_row(table_rows, "Immediate cause of death")
-            row_intermediate = pick_row(table_rows, "Intermediate cause of death I")
-            row_underlying   = pick_row(table_rows, "Underlying cause of death II")
+            progress.empty()
+            st.session_state.icd_results = {
+                "concepts": concepts,
+                "coded_causes": coded_causes,
+            }
 
-            valid_status = validation.get("validation_status", "")
-            issues_list  = validation.get("issues", [])
-            if isinstance(issues_list, list):
-                issues_text = "; ".join(issues_list)
-            else:
-                issues_text = str(issues_list)
+        except Exception as e:
+            progress.empty()
+            st.error("خطأ في التحليل: " + str(e))
+            st.session_state.icd_results = None
 
-            # Immediate cause row
-            st.markdown("**Immediate cause of death**")
-            c1, c2, c3, c4 = st.columns([2, 1, 2, 1])
-            with c1:
-                st.text_input("Immediate cause of death",
-                              value=row_immediate["cause_text"],
-                              key="imm_text_box")
-            with c2:
-                st.text_input("Interval",
-                              value=row_immediate["interval"],
-                              key="imm_interval_box")
-            with c3:
-                st.text_input("is valid? why?",
-                              value=f"{valid_status} {issues_text}",
-                              key="imm_valid_box")
-            with c4:
-                st.text_input("ICD Code",
-                              value=row_immediate["icd_code"],
-                              key="imm_icd_box")
+    # ── Display results ───────────────────────────────────────────────────────
+    if st.session_state.icd_results:
+        coded_causes = st.session_state.icd_results["coded_causes"]
 
-            # Intermediate cause row
-            st.markdown("**Intermediate cause of death I**")
-            d1, d2, d3, d4 = st.columns([2, 1, 2, 1])
-            with d1:
-                st.text_input("Intermediate cause of death I",
-                              value=row_intermediate["cause_text"],
-                              key="int_text_box")
-            with d2:
-                st.text_input("Interval",
-                              value=row_intermediate["interval"],
-                              key="int_interval_box")
-            with d3:
-                st.text_input("is valid? why?",
-                              value=f"{valid_status} {issues_text}",
-                              key="int_valid_box")
-            with d4:
-                st.text_input("ICD Code",
-                              value=row_intermediate["icd_code"],
-                              key="int_icd_box")
+        tab1, tab2 = st.tabs(["رموز ICD-10 والتوصيات", "معاينة الشهادة"])
 
-            # Underlying cause row
-            st.markdown("**Underlying cause of death II**")
-            e1, e2, e3, e4 = st.columns([2, 1, 2, 1])
-            with e1:
-                st.text_input("Underlying cause of death II",
-                              value=row_underlying["cause_text"],
-                              key="und_text_box")
-            with e2:
-                st.text_input("Interval",
-                              value=row_underlying["interval"],
-                              key="und_interval_box")
-            with e3:
-                st.text_input("is valid? why?",
-                              value=f"{valid_status} {issues_text}",
-                              key="und_valid_box")
-            with e4:
-                st.text_input("ICD Code",
-                              value=row_underlying["icd_code"],
-                              key="und_icd_box")
+        with tab1:
+            st.markdown(
+                '<div style="font-size:.8rem;color:var(--muted);margin-bottom:1rem">'
+                'كل رمز مستخرج من قاعدة ICD-10 عبر البحث الدلالي + تقييم Claude. '
+                'يمكن تعديل رمز ICD في أي خانة.</div>',
+                unsafe_allow_html=True)
 
-            st.success("Done ✅")
-    else:
-        st.info("Fill the form on the left and click Analyze 🔍 to populate certificate preview.")
+            role_colors = {"immediate": "#006940", "contributing": "#2d7a4f", "other": "#5a7060"}
 
+            for idx, item in enumerate(coded_causes):
+                acc    = item.get("acceptable_main", "")
+                bg_acc = "#006940" if acc == "Acceptable" else ("#c0392b" if acc else "#888")
+                badge  = (
+                    '<span style="background:' + bg_acc + ';color:white;border-radius:4px;'
+                    'padding:2px 10px;font-size:.73rem;font-weight:700">'
+                    + ("✓ مقبول" if acc == "Acceptable"
+                       else ("✗ غير مقبول" if acc else "غير محدد"))
+                    + '</span>')
+                rc = role_colors.get(item["role"], "#555")
 
-st.markdown("---")
-st.caption(
-    "This tool is experimental and does not replace certified mortality coding staff. "
-    "Always review ICD codes and causal chain before finalizing a death certificate."
-)
+                # header bar
+                st.markdown(
+                    '<div style="border:1px solid #c8dece;border-radius:8px;'
+                    'margin-bottom:1.2rem;overflow:hidden">'
+                    '<div style="background:' + rc + ';color:white;padding:.45rem .9rem;'
+                    'font-size:.82rem;font-weight:700">'
+                    + item["label"] + ' — ' + item["cause"]
+                    + ' <span style="opacity:.75;font-weight:400"> | الفترة: '
+                    + item["interval"] + '</span></div>',
+                    unsafe_allow_html=True)
+
+                # 4 columns: ICD code | short name | long desc | notes
+                c1, c2, c3, c4 = st.columns([1, 1.6, 2.6, 2.8])
+                with c1:
+                    st.text_input(
+                        "رمز ICD-10",
+                        value=item.get("code_formatted", item.get("selected_code", "")),
+                        key="code_" + str(idx),
+                    )
+                    st.markdown(badge, unsafe_allow_html=True)
+                with c2:
+                    st.text_input(
+                        "اسم المرض",
+                        value=item.get("short_desc", ""),
+                        key="short_" + str(idx),
+                        disabled=True,
+                    )
+                with c3:
+                    st.text_area(
+                        "الوصف التفصيلي",
+                        value=item.get("long_desc", ""),
+                        key="long_" + str(idx),
+                        height=100,
+                        disabled=True,
+                    )
+                with c4:
+                    notes_bg = "#fff5f5" if acc != "Acceptable" else "#f0faf4"
+                    st.markdown(
+                        '<div style="background:' + notes_bg + ';border:1px solid #d0ddd2;'
+                        'border-radius:6px;padding:.55rem .75rem;font-size:.82rem;'
+                        'color:#1a2e1a;min-height:100px;line-height:1.6">'
+                        '<div style="font-weight:700;color:var(--green);margin-bottom:.3rem">'
+                        'ملاحظات الترميز</div>'
+                        + item.get("notes", "") + '</div>',
+                        unsafe_allow_html=True)
+
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        with tab2:
+            cert_no  = (fd.get("cert_number")
+                        or "DC-" + str(datetime.date.today().year)
+                        + "-" + fd.get("national_id", "")[-4:])
+            imm_item = next((x for x in coded_causes if x["role"] == "immediate"), {})
+
+            cont_rows = ""
+            let_map   = ["ب", "ج", "د", "هـ"]
+            cont_list = [x for x in coded_causes if x["role"] == "contributing"]
+            for ci, x in enumerate(cont_list):
+                cont_rows += (
+                    '<div class="cert-field">'
+                    '<span class="cert-label">(' + (let_map[ci] if ci < 4 else "+") + ') مساهم</span>'
+                    '<span>' + x["cause"] + ' — <b>' + x.get("code_formatted", "") + '</b>'
+                    + ' <span style="font-size:.78rem;color:#666">(' + x["interval"] + ')</span>'
+                    + '</span></div>')
+
+            other_rows = ""
+            for x in coded_causes:
+                if x["role"] == "other":
+                    other_rows += (
+                        '<div class="cert-field">'
+                        '<span class="cert-label">حالة أخرى</span>'
+                        '<span>' + x["cause"] + ' — <b>' + x.get("code_formatted", "") + '</b></span>'
+                        '</div>')
+
+            st.markdown(
+                '<div class="cert-preview">'
+                '<div style="display:flex;justify-content:space-between;align-items:center;'
+                'border-bottom:2px solid var(--green);padding-bottom:1rem;margin-bottom:1.4rem">'
+                '<div>'
+                '<div style="font-size:.95rem;font-weight:700;color:var(--green)">المملكة العربية السعودية</div>'
+                '<div style="font-size:.8rem;color:var(--muted)">وزارة الصحة</div>'
+                '<div style="font-size:.75rem;color:#888">' + hospital_name + ' — ' + hospital_city + '</div>'
+                '</div>'
+                '<div style="text-align:center">'
+                '<div class="cert-title">شهادة الوفاة</div>'
+                '<div class="cert-sub">DEATH CERTIFICATE</div>'
+                '<div style="background:var(--green);color:white;border-radius:4px;'
+                'padding:2px 10px;font-size:.76rem;margin-top:5px;display:inline-block">'
+                'رقم: ' + cert_no + '</div>'
+                '</div>'
+                '<div style="text-align:left">'
+                '<div style="font-size:.95rem;font-weight:700;color:var(--green)">Kingdom of Saudi Arabia</div>'
+                '<div style="font-size:.8rem;color:var(--muted)">Ministry of Health</div>'
+                '</div></div>'
+                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2rem;margin-bottom:1.4rem">'
+                '<div>'
+                '<div class="cert-field"><span class="cert-label">الاسم</span><span>' + fd.get("full_name_ar", "—") + '</span></div>'
+                '<div class="cert-field"><span class="cert-label">الهوية</span><span>' + fd.get("national_id", "—") + '</span></div>'
+                '<div class="cert-field"><span class="cert-label">الجنس</span><span>' + fd.get("sex", "—") + '</span></div>'
+                '<div class="cert-field"><span class="cert-label">العمر</span><span>' + str(fd.get("age_years", "—")) + ' سنة</span></div>'
+                '</div><div>'
+                '<div class="cert-field"><span class="cert-label">تاريخ الوفاة</span><span>' + str(fd.get("dod", "—")) + '</span></div>'
+                '<div class="cert-field"><span class="cert-label">مكان الوفاة</span><span>' + fd.get("place_of_death", "—") + '</span></div>'
+                '<div class="cert-field"><span class="cert-label">نوع الوفاة</span><span>' + fd.get("death_type", "—") + '</span></div>'
+                '</div></div>'
+                '<div style="background:var(--green-light);border-radius:6px;padding:1rem 1.2rem;'
+                'margin-bottom:1.4rem;border:1px solid #9ecaad">'
+                '<div style="font-weight:700;color:var(--green);margin-bottom:.6rem">أسباب الوفاة / Causes of Death</div>'
+                '<div class="cert-field">'
+                '<span class="cert-label">(أ) السبب الفوري</span>'
+                '<span>' + imm_item.get("cause", "—") + ' — <b>' + imm_item.get("code_formatted", "") + '</b>'
+                + ' <span style="font-size:.78rem;color:#666">(' + imm_item.get("interval", "—") + ')</span>'
+                + '</span></div>'
+                + cont_rows + other_rows
+                + '</div>'
+                '<div style="display:flex;justify-content:space-between;align-items:flex-end;'
+                'padding-top:1.2rem;border-top:1px solid #d0ddd2">'
+                '<div>'
+                '<div style="font-weight:700;color:var(--green);font-size:.85rem">الطبيب المُصدر</div>'
+                '<div style="margin-top:3px">' + (doctor_name or "________________________________") + '</div>'
+                '<div style="font-size:.75rem;color:#888;margin-top:8px">التوقيع: _______________________</div>'
+                '</div>'
+                '<div class="cert-stamp">وزارة<br>الصحة<br>MOH<br>ختم رسمي</div>'
+                '<div style="text-align:left">'
+                '<div style="font-weight:700;color:var(--green);font-size:.85rem">تاريخ الإصدار</div>'
+                '<div style="margin-top:3px">' + str(fd.get("date_issued", datetime.date.today())) + '</div>'
+                '</div></div></div>',
+                unsafe_allow_html=True)
+
+            st.markdown("---")
+            cert_lines = [
+                "شهادة وفاة / DEATH CERTIFICATE",
+                "رقم: " + cert_no,
+                "=" * 55,
+                "المستشفى: " + hospital_name + " – " + hospital_city,
+                "",
+                "الاسم: " + fd.get("full_name_ar", ""),
+                "الهوية: " + fd.get("national_id", ""),
+                "الجنس: " + fd.get("sex", "") + "   العمر: " + str(fd.get("age_years", "")) + " سنة",
+                "تاريخ الوفاة: " + str(fd.get("dod", "")),
+                "مكان الوفاة: " + fd.get("place_of_death", ""),
+                "",
+                "أسباب الوفاة:",
+            ]
+            for item in coded_causes:
+                cert_lines.append(
+                    "  [" + item["label"] + "] " + item["cause"]
+                    + " | " + item.get("code_formatted", "")
+                    + " | " + item.get("short_desc", "")
+                    + " | الفترة: " + item["interval"])
+                if item.get("notes"):
+                    cert_lines.append("    ملاحظة: " + item["notes"])
+            cert_lines += [
+                "",
+                "الطبيب: " + doctor_name,
+                "تاريخ الإصدار: " + str(fd.get("date_issued", "")),
+            ]
+            st.download_button(
+                "تحميل ملخص الشهادة / Download Certificate",
+                data="\n".join(cert_lines).encode("utf-8"),
+                file_name="death_cert_" + cert_no + ".txt",
+                mime="text/plain",
+            )
+
+    st.markdown("---")
+    b1, b2, _ = st.columns([1, 1, 6])
+    with b1:
+        if st.button("السابق", use_container_width=True):
+            st.session_state.page = 3
+            st.session_state.icd_results = None
+            st.rerun()
+    with b2:
+        if st.button("شهادة جديدة", use_container_width=True):
+            st.session_state.page      = 1
+            st.session_state.form_data = {}
+            st.session_state.icd_results = None
+            st.rerun()
